@@ -1,141 +1,166 @@
+
+import os
 import requests
 
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Mindat GIS API")
 
 MINDAT_API_URL = "https://api.mindat.org"
-YOUR_API_KEY = ""       # you need to fill this in
+MINDAT_API_KEY = os.getenv("MINDAT_API_KEY")
 
-# Where to get an API key:
-# 1) Log in to Mindat.org, you need an authenticated account (ask Jolyon!)
-# 2) go to "My homepage"->"Edit my page"
-# 3) At the bottom of the page you will find "API Key - Your key:"
-# *  best practice is not use API KEY directly in code,
-#    but store them in ENV variables, or files outside the project directory
+# Add your GIS application's domain in Render environment
+# Example: https://my-gis-app.onrender.com
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS", "*"
+    ).split(",")
+    if origin.strip()
+]
 
-
-headers = {'Authorization': 'Token '+YOUR_API_KEY}
-params = {'format': 'json'}
-
-# https://api.mindat.org/items/?format=json
-# return all mindat items (minerals, varieties, groups, synonyms, rocks, etc.),
-# unfiltered, paginated
-
-# Sending GET HTTP request with specified header & parameters
-response = requests.get(MINDAT_API_URL+"/items/",
-                        params=params,
-                        headers=headers)
-print(response)                            #Expected output: >>>  <Response [200]>
-print(response.json())
-
-# https://api.mindat.org/items/?fields=id,name,dispformulasimple&page_size=100
-# display only selected fields.
-# selecting only necessary fields slightly reduces db queries size so its appreciated
-# customize page_size to 100 items per page
-params = {'fields': 'id,name,dispformulasimple',
-          'page_size': '100',
-          'format': 'json'}
-
-r = requests.get(MINDAT_API_URL+"/items/",
-                 params=params,
-                 headers=headers)
-
-# https://api.mindat.org/items/?omit=id,name,dispformulasimple
-# exclude fields from display
-params = {'omit': 'id,name,dispformulasimple',
-          'format': 'json'}
-
-# filters on minerals, examples
-# https://api.mindat.org/items/?density__to=3&crystal_system=Triclinic&color=red&ima=1
-params = {'density__to': '3',
-          'crystal_system': 'Triclinic',
-          'color': 'red',
-          'ima': 1,          # show only minerals approved by ima
-          'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/items/",
-                 params=params,
-                 headers=headers)
-
-print(r)                            #Expected output: >>>  <Response [200]>
-print(r.json())
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
-# for filters reference on this endpoint see generated documentation:
-# https://api.mindat.org/schema/redoc/#tag/items/operation/items_list
+def mindat_request(endpoint, params=None):
+    if not MINDAT_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Mindat API key is not configured"
+        )
 
-# https://api.mindat.org/items/?updated_at=2022-10-30
-# Allows taking only changed records, if someone is syncronizing his db with mindat.
-#Last updated datetime in format %Y-%m-%d %H:%M:%S:
+    headers = {
+        "Authorization": f"Token {MINDAT_API_KEY}"
+    }
 
-# fields that display relations to other items are:
-# groupid - Group id  e.g. Tourmaline group => Elbaite
-# variety of - Variety of, e.g. Quartz => Amethyst
-# synid - Synonym id
-# relations - other relations between items
-# ! to enable relations field in items output add parameter:
-# https://api.mindat.org/items/?expand=relations
-params = {'expand': 'relations',
-          'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/items/",
-                 params=params,
-                 headers=headers)
+    params = params or {}
+    params["format"] = "json"
 
+    try:
+        response = requests.get(
+            f"{MINDAT_API_URL}/{endpoint}/",
+            params=params,
+            headers=headers,
+            timeout=30
+        )
 
-# To list localities, where the mineral/item is present,
-# add 'expand=localities' query parameter
-# https://api.mindat.org/items/?expand=localities&fields=id,name,localities
+        response.raise_for_status()
+        return response.json()
 
+    except requests.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail="Mindat API request timed out"
+        )
 
-# https://api.mindat.org/items/{id}/varieties/
-# special endpoint that returns all varieties of an item (mineral), recursively, e.g. Quartz => Chalcedony => Agate
-# e.g., all varieties of Quartz (except parent, quartz itself):
-# https://api.mindat.org/items/3337/varieties/?fields=id,name,varietyof&page_size=1000
-params = {'fields': 'id,name,varietyof',
-          'page_size': '1000',
-          'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/items/3337/varieties/",
-                 params=params,
-                 headers=headers)
+    except requests.RequestException as e:
+        status = (
+            e.response.status_code
+            if e.response is not None else 502
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Mindat API request failed (upstream status: {status})"
+        )
 
-
-# https://api.mindat.org/items_search/?q=raelgard
-# Endpoint that exactly copies the algorithm of fuzzy search for mineral name on mindat,
-# returning results of fuzzy search
-#        Returns minerals where name contains search term.
-#        If they are not found, returns names with the least levenshtein distance
-#        Query parameters:
-#           q (search term),
-#           size (number of returned records, applicable only for levenshtein search results, default 12)
-params = {'q': 'raelgard',
-          'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/items_search/",
-                 params=params,
-                 headers=headers)
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Mindat returned invalid JSON"
+        )
 
 
-# https://api.mindat.org/minerals_ima/
-# Endpoint returning IMA related data and IMA-approved minerals only
-params = {'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/minerals_ima/",
-                 params=params,
-                 headers=headers)
-
-print(r)                            #Expected output: >>>  <Response [200]>
-print(r.json())
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "Mindat GIS API"
+    }
 
 
-# https://api.mindat.org/localities/?id__in=&updated_at=&elements_inc=&elements_exc=&txt=Belorech&description=&country=
-# Localities endpoint
+# 1. Search minerals by name
+@app.get("/api/minerals/search")
+def search_minerals(
+    q: str = Query(..., min_length=2, max_length=100),
+    size: int = Query(12, ge=1, le=50)
+):
+    return mindat_request(
+        "items_search",
+        {
+            "q": q,
+            "size": size
+        }
+    )
 
-# To list locality's minerals, where the mineral/item is present,
-# add 'expand=items' query parameter
-# https://api.mindat.org/localities/?expand=items&fields=id,name,items
-params = {'expand': 'items',
-          'fields': 'id,name,items',
-          'format': 'json'}
-r = requests.get(MINDAT_API_URL+"/minerals_ima/",
-                 params=params,
-                 headers=headers)
+
+# 2. Retrieve mineral information
+@app.get("/api/minerals")
+def get_minerals(
+    name: str = None,
+    ima: bool = None,
+    page_size: int = Query(100, ge=1, le=500)
+):
+    params = {
+        "fields": "id,name,dispformulasimple",
+        "page_size": page_size
+    }
+
+    if name:
+        params["name__icontains"] = name
+
+    if ima is not None:
+        params["ima"] = int(ima)
+
+    return mindat_request("items", params)
 
 
-# There is automatically generated documentation for MindatAPI in OpenAPI3 format:
-# https://api.mindat.org/schema/redoc
-# it is in beta and many descriptions are not comlete.
+# 3. Retrieve one mineral by ID
+@app.get("/api/minerals/{mineral_id}")
+def get_mineral(mineral_id: int):
+    return mindat_request(
+        f"items/{mineral_id}",
+        {"expand": "relations"}
+    )
+
+
+# 4. Search localities
+@app.get("/api/localities/search")
+def search_localities(
+    txt: str = Query(None, max_length=150),
+    country: str = Query(None, max_length=100),
+    page_size: int = Query(100, ge=1, le=500)
+):
+    params = {
+        "page_size": page_size,
+        "fields": "id,name",
+    }
+
+    if txt:
+        params["txt"] = txt
+
+    if country:
+        params["country"] = country
+
+    return mindat_request("localities", params)
+
+
+# 5. Retrieve localities and associated minerals
+@app.get("/api/localities/with-minerals")
+def localities_with_minerals(
+    page_size: int = Query(100, ge=1, le=500)
+):
+    return mindat_request(
+        "localities",
+        {
+            "expand": "items",
+            "fields": "id,name,items",
+            "page_size": page_size
+        }
+    )
