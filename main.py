@@ -443,11 +443,107 @@ def debug_probe(mineral: str = "stibnite", country: str = "Spain"):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Country scan: "localities of a country + the minerals of each locality" (localities?country=...&expand=geomaterials),
+# read page by page ONCE per country and kept in memory; then any mineral of that country is answered instantly.
+# (loc-by-min answers [] for very common minerals such as gold and only half of the rare ones can be checked.)
+# ---------------------------------------------------------------------------
+SCAN_PAGE_SIZE, SCAN_MAX_PAGES, SCAN_BATCH, SCAN_TTL = 300, 200, 6, 6 * 3600
+SCANS = {}                                                 # country -> {"rows", "next_page", "complete", "errors", "updated"}
+_scan_lock = threading.Lock()
+
+
+def _gm_ids(items):
+    out = set()
+    for x in items or []:
+        i = _loc_id(x)
+        if i:
+            out.add(i)
+    return frozenset(out)
+
+
+def _scan_page(country, page):
+    """-> (rows, is_last_page); rows is None when the page could not be read."""
+    params = {"country": country, "expand": "geomaterials", "page-size": SCAN_PAGE_SIZE, "page": page,
+              "fields": "id,txt,latitude,longitude,country,geomaterials"}
+    try:
+        data = mindat_request("localities", params, timeout=45)
+    except HTTPException as e:
+        return ([], True) if e.status_code == 404 else (None, False)     # 404 = after the last page
+    items = _results(data)
+    rows = [(loc.get("id"), loc.get("txt"), loc.get("latitude"), loc.get("longitude"),
+             loc.get("country") or country, _gm_ids(loc.get("geomaterials")))
+            for loc in items if isinstance(loc, dict)]
+    has_next = isinstance(data, dict) and bool(data.get("next"))
+    return rows, (not items) or (isinstance(data, dict) and not has_next)
+
+
+def advance_scan(country, budget=70.0):
+    """Reads pages of the country until it is complete, the page cap is reached or the time budget is spent.
+    Progress is kept: a later request goes on where this one stopped."""
+    key = country.strip().lower()
+    started = time.monotonic()
+    with _scan_lock:
+        st = SCANS.get(key)
+        if st and st["complete"] and time.time() - st["updated"] > SCAN_TTL:
+            st = None
+        if not st:
+            if len(SCANS) >= 8:                              # keep the memory small: drop the oldest country
+                del SCANS[min(SCANS, key=lambda k: SCANS[k]["updated"])]
+            st = SCANS[key] = {"rows": [], "next_page": 1, "complete": False, "errors": 0, "updated": time.time()}
+        while not st["complete"] and st["next_page"] <= SCAN_MAX_PAGES and time.monotonic() - started < budget:
+            pages = list(range(st["next_page"], min(st["next_page"] + SCAN_BATCH, SCAN_MAX_PAGES + 1)))
+            with ThreadPoolExecutor(max_workers=SCAN_BATCH) as pool:
+                results = list(pool.map(lambda p: _scan_page(country, p), pages))
+            advanced = 0
+            for rows, last in results:
+                if rows is None:                             # unreadable page: stop here, it will be asked again
+                    break
+                st["rows"].extend(rows)
+                advanced += 1
+                if last:
+                    st["complete"] = True
+                    break
+            st["next_page"] += advanced
+            if advanced == 0:
+                st["errors"] += 1
+                if st["errors"] >= 3:
+                    break
+                time.sleep(1.0)
+        st["updated"] = time.time()
+        return st
+
+
+def _via_loc_by_min(ids, country, started, max_chunks=40, chunk=100):
+    """Old way (rare minerals only), used to complete a scan that could not be finished. -> (localities, errors)."""
+    all_ids, errors = localities_with_minerals(ids)
+    chunks = [all_ids[k:k + chunk] for k in range(0, len(all_ids), chunk)][:max_chunks]
+
+    def fetch(ids_chunk):
+        if time.monotonic() - started > 85:
+            return []
+        params = {"id_in": ",".join(str(i) for i in ids_chunk), "country": country,
+                  "fields": "id,txt,latitude,longitude,country", "page-size": len(ids_chunk)}
+        try:
+            data = mindat_request("localities", params)
+        except HTTPException:
+            return []
+        return [{"id": loc.get("id"), "txt": loc.get("txt"), "latitude": loc.get("latitude"),
+                 "longitude": loc.get("longitude"), "country": loc.get("country") or country}
+                for loc in _results(data) if isinstance(loc, dict)]
+
+    out = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for part in pool.map(fetch, chunks):
+            out.extend(part)
+    return out, errors
+
+
 @app.get("/api/minerals/in-country")
 def minerals_in_country(
     mineral: str = Query(..., min_length=2, max_length=100),
     country: str = Query(..., min_length=2, max_length=100),
-    max_localities: int = Query(600, ge=1, le=3000),
+    max_localities: int = Query(1500, ge=1, le=5000),
 ):
     key = (mineral.strip().lower(), country.strip().lower(), max_localities)
     cached = country_cache.get(key)
@@ -458,42 +554,25 @@ def minerals_in_country(
     base = {"mineral": mineral, "country": country, "mineral_ids": [m[0] for m in resolved], "mineral_names": [m[1] for m in resolved]}
     if not resolved:
         return dict(base, count=0, total_with_mineral=0, truncated=False, localities=[])
-    all_ids, loc_errors = localities_with_minerals(base["mineral_ids"])
-    base["loc_by_min_errors"] = loc_errors
-    base["loc_by_min_sample"] = [dict(v, mineral_id=k) for k, v in LOC_SAMPLE.items() if k in base["mineral_ids"]]
-    chunk, max_chunks = 100, 40                              # at most 4000 localities are looked at
-    chunks = [all_ids[k:k + chunk] for k in range(0, len(all_ids), chunk)][:max_chunks]
-    truncated = len(all_ids) > chunk * max_chunks
-
-    def fetch(ids_chunk):
-        if time.monotonic() - started > 80:                  # keep inside the platform time limit
-            return None
-        params = {"id_in": ",".join(str(i) for i in ids_chunk), "country": country,
-                  "fields": "id,txt,latitude,longitude,country", "page-size": len(ids_chunk)}
-        try:
-            data = mindat_request("localities", params)
-        except HTTPException:
-            params.pop("fields")                             # (in case a field name is refused)
-            try:
-                data = mindat_request("localities", params)
-            except HTTPException:
-                return []
-        return [
-            {"id": loc.get("id"), "txt": loc.get("txt"), "latitude": loc.get("latitude"),
-             "longitude": loc.get("longitude"), "country": loc.get("country") or country}
-            for loc in _results(data) if isinstance(loc, dict)
-        ]
-
-    localities = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        for part in pool.map(fetch, chunks):
-            if part is None:
-                truncated = True
-                continue
-            localities.extend(part)
+    target = set(base["mineral_ids"])
+    st = advance_scan(country.strip())
+    complete = st["complete"]
+    found = {}
+    for lid, txt, lat, lon, ctry, gms in st["rows"]:
+        if lid is not None and gms & target:
+            found[lid] = {"id": lid, "txt": txt, "latitude": lat, "longitude": lon, "country": ctry}
+    base.update(method="country-scan", scanned_localities=len(st["rows"]), scan_complete=complete)
+    if not complete:                                         # country too big / Mindat slow: complete with loc-by-min
+        extra, errors = _via_loc_by_min(base["mineral_ids"], country, started)
+        base["loc_by_min_errors"] = errors
+        for loc in extra:
+            found.setdefault(loc["id"], loc)
+    localities = list(found.values())
+    truncated = (not complete) or len(localities) > max_localities
+    total = len(localities)
     localities = localities[:max_localities]
-    result = dict(base, count=len(localities), total_with_mineral=len(all_ids), truncated=truncated, localities=localities)
-    if all_ids or localities:
+    result = dict(base, count=len(localities), total_with_mineral=total, truncated=truncated, localities=localities)
+    if complete:                                             # a partial answer is not kept: the next request goes on with the scan
         country_cache.set(key, result)
     return result
 
