@@ -316,29 +316,50 @@ def resolve_mineral_ids(name, limit=25):
 
 
 def _localities_of_mineral(mineral_id):
-    """Locality ids where ONE mineral has been reported (loc-by-min)."""
+    """Locality ids where ONE mineral has been reported (loc-by-min) -> (ids, error message or None)."""
+    last_error = None
     for exc in ("0", None):                                 # the endpoint wants a non-empty "exc"
         params = {"inc": str(mineral_id)}
         if exc:
             params["exc"] = exc
         try:
             data = mindat_request("loc-by-min", params, timeout=60)
-        except HTTPException:
+        except HTTPException as e:
+            last_error = f"{e.status_code}: {e.detail}"
             continue
         items = data if isinstance(data, list) else _results(data)
-        return [int(x) for x in items if str(x).strip().isdigit()]
-    return []
+        return [int(x) for x in items if str(x).strip().isdigit()], None
+    return [], last_error
 
 
 def localities_with_minerals(ids):
-    """Union of the localities of each mineral. NOT one request with all ids in "inc": Mindat reads that
-    list as "localities that have ALL these minerals", which gives nothing as soon as there are 2+ different minerals."""
-    found = set()
+    """Union of the localities of each mineral (one loc-by-min request per mineral: a list in "inc" means
+    "localities that have ALL these minerals"). Returns (sorted ids, list of errors)."""
+    found, errors = set(), []
     ids = list(ids)[:5]
     with ThreadPoolExecutor(max_workers=5) as pool:
-        for part in pool.map(_localities_of_mineral, ids):
+        for part, err in pool.map(_localities_of_mineral, ids):
             found.update(part)
-    return sorted(found)
+            if err:
+                errors.append(err)
+    return sorted(found), errors
+
+
+@app.get("/api/debug/loc-by-min")
+def debug_loc_by_min(inc: int = Query(5473)):
+    """Raw Mindat answers for loc-by-min (diagnostic: remove when everything works)."""
+    if not MINDAT_API_KEY:
+        raise HTTPException(status_code=500, detail="Mindat API key is not configured")
+    headers = {"Authorization": f"Token {MINDAT_API_KEY}", "Accept": "application/json", "User-Agent": USER_AGENT}
+    out = {}
+    for label, params in (("exc=0", {"inc": inc, "exc": "0"}), ("no exc", {"inc": inc}), ("exc=1", {"inc": inc, "exc": "1"})):
+        try:
+            r = session.get(f"{MINDAT_API_URL}/loc-by-min/", params=params, headers=headers, timeout=60)
+            out[label] = {"status": r.status_code, "content_type": r.headers.get("Content-Type"),
+                          "length": len(r.text), "start": r.text[:300]}
+        except requests.RequestException as e:
+            out[label] = {"error": e.__class__.__name__}
+    return out
 
 
 @app.get("/api/minerals/in-country")
@@ -356,7 +377,8 @@ def minerals_in_country(
     base = {"mineral": mineral, "country": country, "mineral_ids": [m[0] for m in resolved], "mineral_names": [m[1] for m in resolved]}
     if not resolved:
         return dict(base, count=0, total_with_mineral=0, truncated=False, localities=[])
-    all_ids = localities_with_minerals(base["mineral_ids"])
+    all_ids, loc_errors = localities_with_minerals(base["mineral_ids"])
+    base["loc_by_min_errors"] = loc_errors
     chunk, max_chunks = 100, 40                              # at most 4000 localities are looked at
     chunks = [all_ids[k:k + chunk] for k in range(0, len(all_ids), chunk)][:max_chunks]
     truncated = len(all_ids) > chunk * max_chunks
