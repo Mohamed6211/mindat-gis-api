@@ -397,6 +397,52 @@ def debug_loc_by_min(inc: int = Query(5473)):
     return out
 
 
+def _probe(endpoint, params=None, method="GET", body=None):
+    """One raw Mindat call summarised (diagnostic)."""
+    headers = {"Authorization": f"Token {MINDAT_API_KEY}", "Accept": "application/json", "User-Agent": USER_AGENT}
+    url = f"{MINDAT_API_URL}/{endpoint.strip('/')}/"
+    try:
+        r = session.request(method, url, params=params, json=body, headers=headers, timeout=60)
+    except requests.RequestException as e:
+        return {"error": e.__class__.__name__}
+    out = {"status": r.status_code, "length": len(r.text)}
+    try:
+        data = r.json()
+        if isinstance(data, dict):
+            out["keys"] = list(data.keys())[:12]
+            if "count" in data:
+                out["count"] = data["count"]
+            res = data.get("results")
+            if isinstance(res, list):
+                out["n_results"] = len(res)
+        elif isinstance(data, list):
+            out["n_items"] = len(data)
+        out["start"] = json.dumps(data)[:350]
+    except ValueError:
+        out["start"] = r.text[:150]
+    return out
+
+
+@app.get("/api/debug/probe")
+def debug_probe(mineral: str = "stibnite", country: str = "Spain"):
+    """Battery of raw Mindat calls to see which way of 'mineral -> localities of a country' works (diagnostic)."""
+    if not MINDAT_API_KEY:
+        raise HTTPException(status_code=500, detail="Mindat API key is not configured")
+    resolved = resolve_mineral_ids(mineral)
+    mid = resolved[0][0] if resolved else None
+    out = {"mineral": mineral, "resolved": resolved[:3]}
+    if mid is None:
+        return out
+    out["1_loc_by_min_exc0"] = _probe("loc-by-min", {"inc": mid, "exc": "0"})
+    out["2_loc_by_min_exc_other"] = _probe("loc-by-min", {"inc": mid, "exc": "1"})
+    out["3_occurrences_by_min"] = _probe("occurrences", {"min": mid, "page-size": 3})
+    out["4_localities_country"] = _probe("localities", {"country": country, "page-size": 2, "fields": "id,txt,latitude,longitude,country"})
+    out["5_localities_country_expand"] = _probe("localities", {"country": country, "page-size": 2, "expand": "geomaterials", "fields": "id,txt,geomaterials"})
+    out["6_localities_country_elements"] = _probe("localities", {"country": country, "elements_inc": "Au", "page-size": 1, "fields": "id,txt"})
+    out["7_geomin_point_madrid"] = _probe("geomin-point", method="POST", body={"point": {"lat": 40.4, "lon": -3.7}, "distance": "50km"})
+    return out
+
+
 @app.get("/api/minerals/in-country")
 def minerals_in_country(
     mineral: str = Query(..., min_length=2, max_length=100),
