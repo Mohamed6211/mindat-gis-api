@@ -315,6 +315,38 @@ def resolve_mineral_ids(name, limit=25):
     return [(int(m["id"]), m.get("name")) for m in partial[:5]]
 
 
+LOC_SAMPLE = {}                                             # mineral id -> short extract of the raw loc-by-min answer (diagnostic)
+
+
+def _loc_id(x):
+    """A locality id from a number, a numeric string or an object like {"id": 123}."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return int(x)
+    if isinstance(x, str) and x.strip().isdigit():
+        return int(x)
+    if isinstance(x, dict):
+        for k in ("id", "loc_id", "locid", "locality_id", "locality", "loc"):
+            if k in x:
+                return _loc_id(x[k])
+    return None
+
+
+def _loc_items(data):
+    """The list of items of a loc-by-min answer, whatever the envelope."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("results", "localities", "locs", "ids", "data", "loc", "locations"):
+            if isinstance(data.get(k), list):
+                return data[k]
+        for v in data.values():                             # {"<mineral id>": [locality ids]}
+            if isinstance(v, list):
+                return v
+    return []
+
+
 def _localities_of_mineral(mineral_id):
     """Locality ids where ONE mineral has been reported (loc-by-min) -> (ids, error message or None)."""
     last_error = None
@@ -327,8 +359,11 @@ def _localities_of_mineral(mineral_id):
         except HTTPException as e:
             last_error = f"{e.status_code}: {e.detail}"
             continue
-        items = data if isinstance(data, list) else _results(data)
-        return [int(x) for x in items if str(x).strip().isdigit()], None
+        LOC_SAMPLE[mineral_id] = {"type": type(data).__name__, "exc": exc, "extract": json.dumps(data)[:300]}
+        ids = [i for i in (_loc_id(x) for x in _loc_items(data)) if i]
+        if ids or exc is None:
+            return ids, None
+        # empty with exc=0: try again without "exc" before concluding there is nothing
     return [], last_error
 
 
@@ -379,6 +414,7 @@ def minerals_in_country(
         return dict(base, count=0, total_with_mineral=0, truncated=False, localities=[])
     all_ids, loc_errors = localities_with_minerals(base["mineral_ids"])
     base["loc_by_min_errors"] = loc_errors
+    base["loc_by_min_sample"] = [dict(v, mineral_id=k) for k, v in LOC_SAMPLE.items() if k in base["mineral_ids"]]
     chunk, max_chunks = 100, 40                              # at most 4000 localities are looked at
     chunks = [all_ids[k:k + chunk] for k in range(0, len(all_ids), chunk)][:max_chunks]
     truncated = len(all_ids) > chunk * max_chunks
