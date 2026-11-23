@@ -298,23 +298,27 @@ def minerals_near(
 #   locality ids -> localities of the country (localities?id_in=...&country=...), by chunks in parallel.
 # ---------------------------------------------------------------------------
 def resolve_mineral_ids(name, limit=25):
-    attempts = [{"q": name}, {"name": f"*{name}*"}, {"name": name}]
-    for extra in attempts:
+    """Mineral name -> [(id, name)]. An exact name match wins (one id); otherwise at most 5 partial matches."""
+    wanted = name.strip().lower()
+    partial = []
+    for extra in ({"name": name}, {"q": name}, {"name": f"*{name}*"}):
         try:
             data = mindat_request("geomaterials", dict(extra, fields="id,name", **{"page-size": limit}))
         except HTTPException:
             continue
         found = [m for m in _results(data) if isinstance(m, dict) and m.get("id") is not None]
-        match = [m for m in found if name.lower() in str(m.get("name", "")).lower()]
-        if match:
-            return [(int(m["id"]), m.get("name")) for m in match]
-    return []
+        exact = [m for m in found if str(m.get("name", "")).strip().lower() == wanted]
+        if exact:
+            return [(int(m["id"]), m.get("name")) for m in exact[:1]]
+        if not partial:
+            partial = [m for m in found if wanted in str(m.get("name", "")).lower()]
+    return [(int(m["id"]), m.get("name")) for m in partial[:5]]
 
 
-def localities_with_minerals(ids):
-    inc = ",".join(str(i) for i in ids)
+def _localities_of_mineral(mineral_id):
+    """Locality ids where ONE mineral has been reported (loc-by-min)."""
     for exc in ("0", None):                                 # the endpoint wants a non-empty "exc"
-        params = {"inc": inc}
+        params = {"inc": str(mineral_id)}
         if exc:
             params["exc"] = exc
         try:
@@ -324,6 +328,17 @@ def localities_with_minerals(ids):
         items = data if isinstance(data, list) else _results(data)
         return [int(x) for x in items if str(x).strip().isdigit()]
     return []
+
+
+def localities_with_minerals(ids):
+    """Union of the localities of each mineral. NOT one request with all ids in "inc": Mindat reads that
+    list as "localities that have ALL these minerals", which gives nothing as soon as there are 2+ different minerals."""
+    found = set()
+    ids = list(ids)[:5]
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for part in pool.map(_localities_of_mineral, ids):
+            found.update(part)
+    return sorted(found)
 
 
 @app.get("/api/minerals/in-country")
@@ -341,7 +356,7 @@ def minerals_in_country(
     base = {"mineral": mineral, "country": country, "mineral_ids": [m[0] for m in resolved], "mineral_names": [m[1] for m in resolved]}
     if not resolved:
         return dict(base, count=0, total_with_mineral=0, truncated=False, localities=[])
-    all_ids = sorted(set(localities_with_minerals(base["mineral_ids"])))
+    all_ids = localities_with_minerals(base["mineral_ids"])
     chunk, max_chunks = 100, 40                              # at most 4000 localities are looked at
     chunks = [all_ids[k:k + chunk] for k in range(0, len(all_ids), chunk)][:max_chunks]
     truncated = len(all_ids) > chunk * max_chunks
