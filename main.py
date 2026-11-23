@@ -539,6 +539,55 @@ def _via_loc_by_min(ids, country, started, max_chunks=40, chunk=100):
     return out, errors
 
 
+@app.get("/api/debug/scan")
+def debug_scan(country: str = "Morocco", mineral_id: int = 5473):
+    """What the country scan holds, cross-checked with another Mindat filter (diagnostic: remove when everything works)."""
+    if not MINDAT_API_KEY:
+        raise HTTPException(status_code=500, detail="Mindat API key is not configured")
+    st = advance_scan(country.strip())
+    rows = st["rows"]
+    counts = {}
+    for r in rows:
+        for m in r[5]:
+            counts[m] = counts.get(m, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+    names = resolve_mineral_names([m for m, _ in top])
+    scan_ids = {r[0] for r in rows}
+    out = {
+        "scan": {"rows": len(rows), "complete": st["complete"], "next_page": st["next_page"], "errors": st["errors"],
+                 "with_minerals": sum(1 for r in rows if r[5]), "with_coordinates": sum(1 for r in rows if r[2] is not None),
+                 "with_target_mineral": sum(1 for r in rows if mineral_id in r[5]),
+                 "top_minerals": [{"id": m, "name": names.get(m), "localities": n} for m, n in top],
+                 "first_rows": [{"id": r[0], "txt": r[1], "n_minerals": len(r[5])} for r in rows[:3]]},
+    }
+    # other filter: localities of the country that contain the element Au (counted page by page, ids only)
+    au_ids, page, last_status = [], 1, None
+    while page <= 12:
+        try:
+            data = mindat_request("localities", {"country": country, "elements_inc": "Au", "fields": "id", "page-size": 300, "page": page}, timeout=45)
+        except HTTPException as e:
+            last_status = f"{e.status_code}: {e.detail}"
+            break
+        items = _results(data)
+        au_ids += [x.get("id") for x in items if isinstance(x, dict)]
+        if not items or not (isinstance(data, dict) and data.get("next")):
+            break
+        page += 1
+    out["elements_inc_Au"] = {"count": len(au_ids), "pages_read": page, "stopped": last_status,
+                              "in_scan": sum(1 for i in au_ids if i in scan_ids), "sample_ids": au_ids[:5]}
+    if au_ids:
+        try:
+            data = mindat_request("localities", {"id_in": ",".join(str(i) for i in au_ids[:3]), "expand": "geomaterials",
+                                                 "fields": "id,txt,country,geomaterials", "page-size": 3})
+            out["elements_inc_Au"]["first_three"] = [
+                {"id": x.get("id"), "txt": x.get("txt"), "country": x.get("country"),
+                 "n_geomaterials": len(x.get("geomaterials") or []), "has_target": mineral_id in _gm_ids(x.get("geomaterials"))}
+                for x in _results(data) if isinstance(x, dict)]
+        except HTTPException as e:
+            out["elements_inc_Au"]["first_three_error"] = f"{e.status_code}: {e.detail}"
+    return out
+
+
 @app.get("/api/minerals/in-country")
 def minerals_in_country(
     mineral: str = Query(..., min_length=2, max_length=100),
